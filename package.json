@@ -1,0 +1,29 @@
+{
+  "name": "discord-gsd",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Discord bridge for running GSD sessions and posting final-only output.",
+  "type": "module",
+  "bin": {
+    "discord-gsd": "./dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "dev": "tsx watch src/index.ts",
+    "start": "node dist/index.js",
+    "test": "npm run build && node --test dist/__tests__/output-buffer.test.js dist/__tests__/routing.test.js"
+  },
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "dependencies": {
+    "@gsd-build/rpc-client": "^2.52.0",
+    "discord.js": "^14.25.1"
+  },
+  "devDependencies": {
+    "@types/node": "^24.12.0",
+    "tsx": "^4.20.6",
+    "typescript": "^5.8.3"
+  }
+}
