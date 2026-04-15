@@ -162,6 +162,11 @@ export class SessionController extends EventEmitter {
     this.emit("session-event", envelope);
 
     const record = event as Record<string, unknown>;
+
+    if (record.type === "execution_complete") {
+      session.isStreaming = false;
+    }
+
     if (record.type === "cost_update") {
       const costEvent = event as unknown as RpcCostUpdateEvent;
       session.cost.totalCost = Math.max(session.cost.totalCost, costEvent.cumulativeCost ?? 0);
@@ -174,6 +179,7 @@ export class SessionController extends EventEmitter {
     }
 
     if (record.type === "error" || record.type === "session_error") {
+      session.isStreaming = false;
       session.status = "error";
       session.error = sessionErrorMessage(event);
       const payload: SessionErrorEvent = {
@@ -188,6 +194,7 @@ export class SessionController extends EventEmitter {
 
     if (isTerminalNotification(record)) {
       if (isBlockedNotification(record)) {
+        session.isStreaming = false;
         session.status = "blocked";
         session.pendingBlocker = extractBlocker(event);
         const payload: SessionBlockedEvent = {
@@ -200,6 +207,7 @@ export class SessionController extends EventEmitter {
         return;
       }
 
+      session.isStreaming = false;
       session.status = "completed";
       session.pendingBlocker = null;
       const payload: SessionCompletedEvent = {
@@ -212,6 +220,7 @@ export class SessionController extends EventEmitter {
     }
 
     if (isBlockingUiRequest(record)) {
+      session.isStreaming = false;
       session.status = "blocked";
       session.pendingBlocker = extractBlocker(event);
       const payload: SessionBlockedEvent = {
@@ -246,6 +255,7 @@ export class SessionController extends EventEmitter {
       projectDir,
       projectName,
       status: "starting",
+      isStreaming: false,
       client,
       events: [],
       pendingBlocker: null,
@@ -277,6 +287,7 @@ export class SessionController extends EventEmitter {
       this.emit("session-started", startedEvent);
 
       await client.prompt(command);
+      session.isStreaming = true;
       this.logger.info("session started", {
         sessionId: session.sessionId,
         projectDir: session.projectDir,
@@ -284,6 +295,7 @@ export class SessionController extends EventEmitter {
       return session;
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
+      session.isStreaming = false;
       session.status = "error";
       session.error = message;
       this.sessions.delete(projectDir);
@@ -345,6 +357,7 @@ export class SessionController extends EventEmitter {
       const normalized = normalizeBlockerReply(session.pendingBlocker, input);
       session.client.sendUIResponse(session.pendingBlocker.id, { value: normalized });
       session.pendingBlocker = null;
+      session.isStreaming = true;
       session.status = "running";
       this.logger.info("blocker resolved", {
         sessionId,
@@ -358,14 +371,25 @@ export class SessionController extends EventEmitter {
   }
 
   private async promptOrSteer(session: ManagedSession, input: string): Promise<void> {
-    if (session.status === "running" || session.status === "starting") {
+    if (session.isStreaming) {
+      this.logger.info("session input dispatched", {
+        sessionId: session.sessionId,
+        mode: "steer",
+        status: session.status,
+      });
       await session.client.steer(input);
       return;
     }
 
     session.status = "running";
     session.error = undefined;
+    this.logger.info("session input dispatched", {
+      sessionId: session.sessionId,
+      mode: "prompt",
+      status: session.status,
+    });
     await session.client.prompt(input);
+    session.isStreaming = true;
   }
 
   getSession(sessionId: string): ManagedSession | undefined {
@@ -389,6 +413,7 @@ export class SessionController extends EventEmitter {
         // ignored
       }
       session.status = "cancelled";
+      session.isStreaming = false;
     }
     this.sessions.clear();
   }

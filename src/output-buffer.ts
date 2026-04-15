@@ -1,7 +1,13 @@
 import type { SdkAgentEvent } from "@gsd-build/rpc-client";
 
+export interface BufferedAssistantOutput {
+  text: string;
+  modelLabel?: string;
+}
+
 interface BufferedOutputState {
   latestAssistantText?: string;
+  latestModelLabel?: string;
 }
 
 function extractTextBlocks(value: unknown): string[] {
@@ -45,7 +51,7 @@ export function extractMessageText(source: unknown): string {
   return "";
 }
 
-export function extractAssistantText(event: SdkAgentEvent): string | null {
+function extractAssistantMessageRecord(event: SdkAgentEvent): Record<string, unknown> | null {
   const record = event as Record<string, unknown>;
   const eventType = typeof record.type === "string" ? record.type : "";
   if (!["message", "message_start", "message_update", "message_end"].includes(eventType)) {
@@ -66,8 +72,39 @@ export function extractAssistantText(event: SdkAgentEvent): string | null {
     return null;
   }
 
+  return message;
+}
+
+export function extractAssistantText(event: SdkAgentEvent): string | null {
+  const message = extractAssistantMessageRecord(event);
+  if (!message) {
+    return null;
+  }
+
   const text = extractMessageText(message);
   return text ? text : null;
+}
+
+export function extractAssistantModelLabel(event: SdkAgentEvent): string | null {
+  const message = extractAssistantMessageRecord(event);
+  if (!message) {
+    return null;
+  }
+
+  const provider = typeof message.provider === "string" ? message.provider.trim() : "";
+  const model = typeof message.model === "string" ? message.model.trim() : "";
+
+  if (provider && model) {
+    return `${provider}/${model}`;
+  }
+  if (model) {
+    return model;
+  }
+  if (provider) {
+    return provider;
+  }
+
+  return null;
 }
 
 export function splitIntoDiscordChunks(text: string, maxLength = 1500): string[] {
@@ -115,19 +152,34 @@ export class FinalOutputStore {
 
   updateFromEvent(sessionId: string, event: SdkAgentEvent): void {
     const assistantText = extractAssistantText(event);
-    if (!assistantText) {
+    const assistantModelLabel = extractAssistantModelLabel(event);
+    if (!assistantText && !assistantModelLabel) {
       return;
     }
 
     const current = this.state.get(sessionId) ?? {};
-    current.latestAssistantText = assistantText;
+    if (assistantText) {
+      current.latestAssistantText = assistantText;
+    }
+    if (assistantModelLabel) {
+      current.latestModelLabel = assistantModelLabel;
+    }
     this.state.set(sessionId, current);
   }
 
-  consume(sessionId: string): string | null {
+  consume(sessionId: string): BufferedAssistantOutput | null {
     const current = this.state.get(sessionId);
     this.state.delete(sessionId);
-    return current?.latestAssistantText?.trim() || null;
+
+    const text = current?.latestAssistantText?.trim();
+    if (!text) {
+      return null;
+    }
+
+    return {
+      text,
+      ...(current?.latestModelLabel ? { modelLabel: current.latestModelLabel } : {}),
+    };
   }
 
   clear(sessionId: string): void {

@@ -8,6 +8,7 @@ import {
   GatewayIntentBits,
   Interaction,
   Message,
+  MessageFlags,
   REST,
   Routes,
   SlashCommandBuilder,
@@ -27,7 +28,7 @@ import type {
   SessionThreadState,
 } from "./models.js";
 import { formatBlockerMessage } from "./blockers.js";
-import { FinalOutputStore, splitIntoDiscordChunks } from "./output-buffer.js";
+import { FinalOutputStore, extractAssistantModelLabel, splitIntoDiscordChunks } from "./output-buffer.js";
 import { buildThreadName, resolveRelayTarget } from "./routing.js";
 import { SessionController } from "./session-controller.js";
 
@@ -41,6 +42,54 @@ const DG_COMMAND = new SlashCommandBuilder()
       .setRequired(true),
   )
   .toJSON();
+
+const DG_REATTACH_COMMAND = new SlashCommandBuilder()
+  .setName("dg-reattach")
+  .setDescription("Reattach the current in-memory GSD session to this thread or a new thread")
+  .toJSON();
+
+const THINKING_FRAMES = [
+  "↻ GSD is thinking…",
+  "↺ GSD is thinking…",
+  "⟳ GSD is thinking…",
+  "⟲ GSD is thinking…",
+] as const;
+
+interface LoadingIndicatorState {
+  activationTimer?: ReturnType<typeof setTimeout>;
+  tickTimer?: ReturnType<typeof setInterval>;
+  messageId?: string;
+  frameIndex: number;
+}
+
+interface ThinkingTranscriptState {
+  fullText: string;
+  sentChars: number;
+  part: number;
+  modelLabel?: string;
+}
+
+function thinkingFrame(index: number): string {
+  return THINKING_FRAMES[index % THINKING_FRAMES.length] ?? THINKING_FRAMES[0];
+}
+
+function extractThinkingText(source: unknown): string {
+  if (!source || typeof source !== "object") {
+    return "";
+  }
+
+  const record = source as Record<string, unknown>;
+  if (!Array.isArray(record.content)) {
+    return "";
+  }
+
+  return record.content
+    .filter((item): item is { type?: string; thinking?: string; redacted?: boolean } => typeof item === "object" && item !== null)
+    .filter((item) => item.type === "thinking" && typeof item.thinking === "string" && item.redacted !== true)
+    .map((item) => item.thinking ?? "")
+    .join("\n")
+    .trim();
+}
 
 function describeDiscordStartupError(error: unknown, config: AppConfig): string {
   const message = error instanceof Error ? error.message : String(error);
@@ -77,6 +126,8 @@ export class DiscordGsdService {
   private readonly threadToSession = new Map<string, string>();
   private readonly messageToSession = new Map<string, string>();
   private readonly pendingThreadByProject = new Map<string, SessionThreadState>();
+  private readonly loadingIndicators = new Map<string, LoadingIndicatorState>();
+  private readonly thinkingStreams = new Map<string, ThinkingTranscriptState>();
 
   constructor(
     private readonly config: AppConfig,
@@ -126,6 +177,20 @@ export class DiscordGsdService {
   }
 
   async stop(): Promise<void> {
+    const sessionIds = [...this.sessionThreads.keys()];
+
+    for (const sessionId of sessionIds) {
+      await this.stopLoadingIndicator(sessionId);
+      await this.flushRemainingThinking(sessionId);
+    }
+
+    await Promise.allSettled(sessionIds.map((sessionId) =>
+      this.sendToSession(
+        sessionId,
+        "⚠️ discord-gsd is shutting down. This in-memory GSD session will close with the process. After restart, start a new run with `/dg ...`. `/dg-reattach` only works while the same process is still alive.",
+      ),
+    ));
+
     await this.client.destroy();
     await this.controller.shutdown();
   }
@@ -183,11 +248,11 @@ export class DiscordGsdService {
     const rest = new REST({ version: "10" }).setToken(this.config.discordBotToken);
     await rest.put(
       Routes.applicationGuildCommands(applicationId, this.config.discordGuildId),
-      { body: [DG_COMMAND] },
+      { body: [DG_COMMAND, DG_REATTACH_COMMAND] },
     );
     this.logger.info("discord slash commands registered", {
       guildId: this.config.discordGuildId,
-      commandCount: 1,
+      commandCount: 2,
     });
   }
 
@@ -203,22 +268,29 @@ export class DiscordGsdService {
   }
 
   private async onInteraction(interaction: Interaction): Promise<void> {
-    if (!interaction.isChatInputCommand() || interaction.commandName !== "dg") {
+    if (!interaction.isChatInputCommand()) {
       return;
     }
 
     if (!this.isAuthorized(interaction.user.id)) {
-      await interaction.reply({ content: "You are not allowed to use this bot.", ephemeral: true });
+      await interaction.reply({ content: "You are not allowed to use this bot.", flags: MessageFlags.Ephemeral });
       return;
     }
 
-    await this.handleDgCommand(interaction);
+    if (interaction.commandName === "dg") {
+      await this.handleDgCommand(interaction);
+      return;
+    }
+
+    if (interaction.commandName === "dg-reattach") {
+      await this.handleReattachCommand(interaction);
+    }
   }
 
   private async handleDgCommand(interaction: ChatInputCommandInteraction): Promise<void> {
     const input = interaction.options.getString("input", true).trim();
     if (!input) {
-      await interaction.reply({ content: "Input cannot be empty.", ephemeral: true });
+      await interaction.reply({ content: "Input cannot be empty.", flags: MessageFlags.Ephemeral });
       return;
     }
 
@@ -228,7 +300,7 @@ export class DiscordGsdService {
       ? this.sessionThreads.get(activeThreadSession) ?? null
       : await this.getOrCreatePendingThread(input);
 
-    await interaction.deferReply({ ephemeral: true });
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
 
     try {
       const dispatch = await this.controller.dispatch(input);
@@ -243,6 +315,8 @@ export class DiscordGsdService {
         await this.sendToSession(mapped.sessionId, `Started session for \`${dispatch.session.projectName}\`. Reply here or use \`/dg\` again.`);
       }
 
+      void this.startLoadingIndicator(mapped.sessionId);
+
       await interaction.editReply({
         content: mapped.threadId === activeChannelId
           ? "Relayed to this thread."
@@ -256,6 +330,56 @@ export class DiscordGsdService {
         await this.sendToSession(threadState.sessionId, `❌ Failed to start or relay to GSD: ${message}`);
       }
     }
+  }
+
+  private async handleReattachCommand(interaction: ChatInputCommandInteraction): Promise<void> {
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+
+    const session = this.controller.getCurrentProjectSession();
+    if (!session) {
+      await interaction.editReply({
+        content: "No active in-memory GSD session is available to reattach.",
+      });
+      return;
+    }
+
+    const currentChannel = interaction.channel;
+    if (currentChannel?.isThread()) {
+      const marker = await currentChannel.send({
+        content: `🔗 Reattached session \`${session.projectName}\` here.`,
+        allowedMentions: { parse: [] },
+      });
+      const state: SessionThreadState = {
+        sessionId: session.sessionId,
+        threadId: currentChannel.id,
+        starterMessageId: marker.id,
+        lastBotMessageIds: new Set([marker.id]),
+      };
+      this.unbindSession(session.sessionId);
+      this.bindSessionState(session.sessionId, state);
+      await interaction.editReply({ content: "Reattached the current session to this thread." });
+      return;
+    }
+
+    const parent = await this.getParentChannel();
+    const starter = await parent.send({
+      content: `🔗 Reattaching GSD session for \`${session.projectName}\`...`,
+      allowedMentions: { parse: [] },
+    });
+    const thread = await starter.startThread({
+      name: buildThreadName(`reattach ${session.projectName}`),
+      autoArchiveDuration: ThreadAutoArchiveDuration.OneWeek,
+      reason: `discord-gsd reattach for ${session.projectName}`,
+    });
+    const state: SessionThreadState = {
+      sessionId: session.sessionId,
+      threadId: thread.id,
+      starterMessageId: starter.id,
+      lastBotMessageIds: new Set([starter.id]),
+    };
+    this.unbindSession(session.sessionId);
+    this.bindSessionState(session.sessionId, state);
+    await interaction.editReply({ content: `Reattached the current session to <#${thread.id}>.` });
   }
 
   private async getOrCreatePendingThread(input: string): Promise<SessionThreadState> {
@@ -311,18 +435,16 @@ export class DiscordGsdService {
     if (pending) {
       pending.sessionId = sessionId;
       this.pendingThreadByProject.delete(projectDir);
-      this.sessionThreads.set(sessionId, pending);
-      this.threadToSession.set(pending.threadId, sessionId);
-      this.messageToSession.set(pending.starterMessageId, sessionId);
+      this.unbindSession(sessionId);
+      this.bindSessionState(sessionId, pending);
       return pending;
     }
 
     const fallback = await this.getOrCreatePendingThread(input ?? projectName);
     fallback.sessionId = sessionId;
     this.pendingThreadByProject.delete(projectDir);
-    this.sessionThreads.set(sessionId, fallback);
-    this.threadToSession.set(fallback.threadId, sessionId);
-    this.messageToSession.set(fallback.starterMessageId, sessionId);
+    this.unbindSession(sessionId);
+    this.bindSessionState(sessionId, fallback);
     return fallback;
   }
 
@@ -341,6 +463,30 @@ export class DiscordGsdService {
     this.messageToSession.set(messageId, sessionId);
     const state = this.sessionThreads.get(sessionId);
     state?.lastBotMessageIds.add(messageId);
+  }
+
+  private forgetBotMessage(sessionId: string, messageId: string): void {
+    this.messageToSession.delete(messageId);
+    const state = this.sessionThreads.get(sessionId);
+    state?.lastBotMessageIds.delete(messageId);
+  }
+
+  private unbindSession(sessionId: string): void {
+    const existing = this.sessionThreads.get(sessionId);
+    if (!existing) {
+      return;
+    }
+
+    this.threadToSession.delete(existing.threadId);
+    for (const messageId of existing.lastBotMessageIds) {
+      this.messageToSession.delete(messageId);
+    }
+  }
+
+  private bindSessionState(sessionId: string, state: SessionThreadState): void {
+    this.sessionThreads.set(sessionId, state);
+    this.threadToSession.set(state.threadId, sessionId);
+    this.messageToSession.set(state.starterMessageId, sessionId);
   }
 
   private async sendToSession(sessionId: string, content: string): Promise<void> {
@@ -378,6 +524,7 @@ export class DiscordGsdService {
 
     try {
       await this.controller.relayToSession(relayTarget.sessionId, message.content);
+      void this.startLoadingIndicator(relayTarget.sessionId);
       await message.react("📨").catch(() => {});
       this.logger.info("discord reply relayed", {
         sessionId: relayTarget.sessionId,
@@ -407,20 +554,23 @@ export class DiscordGsdService {
   private async onSessionEvent(payload: SessionEventEnvelope): Promise<void> {
     await this.ensureSessionThreadState(payload.sessionId, payload.projectDir, basename(payload.projectDir));
     this.outputStore.updateFromEvent(payload.sessionId, payload.event);
+    await this.maybeStreamThinking(payload.sessionId, payload.event);
 
     const eventType = (payload.event as Record<string, unknown>).type;
     if (eventType === "execution_complete") {
+      await this.flushRemainingThinking(payload.sessionId);
       await this.flushFinalOutput(payload.sessionId, payload.event);
     }
   }
 
   private async flushFinalOutput(sessionId: string, event: SdkAgentEvent): Promise<void> {
-    const output = this.outputStore.consume(sessionId);
+    await this.stopLoadingIndicator(sessionId);
+    const buffered = this.outputStore.consume(sessionId);
     const status = typeof (event as Record<string, unknown>).status === "string"
       ? String((event as Record<string, unknown>).status)
       : "completed";
 
-    if (!output) {
+    if (!buffered) {
       await this.sendToSession(sessionId, status === "completed"
         ? "✅ GSD finished with no assistant text to forward."
         : `⚠️ GSD finished with status: ${status}`);
@@ -431,20 +581,29 @@ export class DiscordGsdService {
       await this.sendToSession(sessionId, `⚠️ GSD finished with status: ${status}`);
     }
 
-    const chunks = splitIntoDiscordChunks(output, this.config.discordMessageChunkSize);
+    const modelLabel = buffered.modelLabel ?? this.config.gsdModel ?? "GSD runtime default";
+    const prefix = `[LLM: ${modelLabel}] `;
+    const chunks = splitIntoDiscordChunks(
+      buffered.text,
+      Math.max(1, this.config.discordMessageChunkSize - prefix.length),
+    );
+
     for (const chunk of chunks) {
-      await this.sendToSession(sessionId, chunk);
+      await this.sendToSession(sessionId, `${prefix}${chunk}`);
     }
 
     this.logger.info("final output flushed", {
       sessionId,
       chunkCount: chunks.length,
-      charCount: output.length,
+      charCount: buffered.text.length,
+      modelLabel,
       status,
     });
   }
 
   private async onSessionBlocked(event: SessionBlockedEvent): Promise<void> {
+    await this.stopLoadingIndicator(event.sessionId);
+    await this.flushRemainingThinking(event.sessionId);
     await this.ensureSessionThreadState(event.sessionId, event.projectDir, event.projectName);
     await this.sendToSession(event.sessionId, formatBlockerMessage(event.blocker));
     this.outputStore.clear(event.sessionId);
@@ -455,6 +614,8 @@ export class DiscordGsdService {
   }
 
   private async onSessionCompleted(event: SessionCompletedEvent): Promise<void> {
+    await this.stopLoadingIndicator(event.sessionId);
+    await this.flushRemainingThinking(event.sessionId);
     await this.ensureSessionThreadState(event.sessionId, event.projectDir, event.projectName);
     this.logger.info("session completed", {
       sessionId: event.sessionId,
@@ -463,23 +624,186 @@ export class DiscordGsdService {
   }
 
   private async onSessionError(event: SessionErrorEvent): Promise<void> {
+    await this.stopLoadingIndicator(event.sessionId);
+    await this.flushRemainingThinking(event.sessionId);
+
     const pending = this.pendingThreadByProject.get(event.projectDir);
     if (pending) {
       pending.sessionId = event.sessionId || "pending";
-      this.sessionThreads.set(pending.sessionId, pending);
-      this.threadToSession.set(pending.threadId, pending.sessionId);
-      this.messageToSession.set(pending.starterMessageId, pending.sessionId);
+      this.bindSessionState(pending.sessionId, pending);
       this.pendingThreadByProject.delete(event.projectDir);
     }
 
     const state = pending ?? this.sessionThreads.get(event.sessionId);
     if (state) {
-      await this.sendToSession(state.sessionId, `❌ GSD session failed: ${event.error}`);
+      await this.sendToSession(state.sessionId, `❌ GSD session failed and closed: ${event.error}`);
     }
 
     this.logger.error("session error surfaced", {
       sessionId: event.sessionId,
       error: event.error,
     });
+  }
+
+  private async startLoadingIndicator(sessionId: string): Promise<void> {
+    if (this.loadingIndicators.has(sessionId)) {
+      return;
+    }
+
+    const indicator: LoadingIndicatorState = { frameIndex: 0 };
+    this.loadingIndicators.set(sessionId, indicator);
+
+    indicator.activationTimer = setTimeout(() => {
+      void this.activateLoadingIndicator(sessionId);
+    }, 2000);
+  }
+
+  private async maybeStreamThinking(sessionId: string, event: SdkAgentEvent): Promise<void> {
+    const record = event as Record<string, unknown>;
+    const eventType = typeof record.type === "string" ? record.type : "";
+    if (!["message_update", "message_end"].includes(eventType)) {
+      return;
+    }
+
+    const message = record.message && typeof record.message === "object"
+      ? record.message
+      : record;
+    const thinkingText = extractThinkingText(message);
+    if (!thinkingText) {
+      return;
+    }
+
+    const state = this.thinkingStreams.get(sessionId) ?? { fullText: "", sentChars: 0, part: 0 };
+    state.fullText = thinkingText;
+    state.sentChars = Math.min(state.sentChars, state.fullText.length);
+
+    const modelLabel = extractAssistantModelLabel(event);
+    if (modelLabel) {
+      state.modelLabel = modelLabel;
+    }
+
+    await this.flushThinkingChunks(sessionId, state, 500);
+    this.thinkingStreams.set(sessionId, state);
+  }
+
+  private async flushThinkingChunks(
+    sessionId: string,
+    state: ThinkingTranscriptState,
+    threshold: number,
+  ): Promise<void> {
+    while (state.fullText.length - state.sentChars >= threshold) {
+      const rawChunk = state.fullText.slice(state.sentChars, state.sentChars + threshold);
+      state.sentChars += rawChunk.length;
+      const chunk = rawChunk.trim();
+      if (!chunk) {
+        continue;
+      }
+
+      state.part += 1;
+      const header = state.modelLabel
+        ? `[Thinking ${state.part} · ${state.modelLabel}]`
+        : `[Thinking ${state.part}]`;
+      await this.sendToSession(sessionId, `${header}\n${chunk}`);
+    }
+  }
+
+  private async flushRemainingThinking(sessionId: string): Promise<void> {
+    const state = this.thinkingStreams.get(sessionId);
+    if (!state) {
+      return;
+    }
+
+    this.thinkingStreams.delete(sessionId);
+    const remaining = state.fullText.slice(state.sentChars).trim();
+    if (!remaining) {
+      return;
+    }
+
+    state.part += 1;
+    const header = state.modelLabel
+      ? `[Thinking ${state.part} · ${state.modelLabel}]`
+      : `[Thinking ${state.part}]`;
+    await this.sendToSession(sessionId, `${header}\n${remaining}`);
+  }
+
+  private async activateLoadingIndicator(sessionId: string): Promise<void> {
+    const indicator = this.loadingIndicators.get(sessionId);
+    const state = this.sessionThreads.get(sessionId);
+    if (!indicator || !state) {
+      return;
+    }
+
+    try {
+      const thread = await this.fetchThread(state.threadId);
+      const message = await thread.send({
+        content: thinkingFrame(indicator.frameIndex),
+        allowedMentions: { parse: [] },
+      });
+      indicator.messageId = message.id;
+      this.rememberBotMessage(sessionId, message.id);
+      indicator.tickTimer = setInterval(() => {
+        void this.tickLoadingIndicator(sessionId);
+      }, 5000);
+    } catch (error) {
+      this.logger.warn("loading indicator activation failed", {
+        sessionId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      this.loadingIndicators.delete(sessionId);
+    }
+  }
+
+  private async tickLoadingIndicator(sessionId: string): Promise<void> {
+    const indicator = this.loadingIndicators.get(sessionId);
+    const state = this.sessionThreads.get(sessionId);
+    if (!indicator || !indicator.messageId || !state) {
+      return;
+    }
+
+    try {
+      const thread = await this.fetchThread(state.threadId);
+      indicator.frameIndex = (indicator.frameIndex + 1) % THINKING_FRAMES.length;
+      const message = await thread.messages.fetch(indicator.messageId);
+      await message.edit({ content: thinkingFrame(indicator.frameIndex) });
+    } catch (error) {
+      this.logger.warn("loading indicator tick failed", {
+        sessionId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
+  private async stopLoadingIndicator(sessionId: string): Promise<void> {
+    const indicator = this.loadingIndicators.get(sessionId);
+    if (!indicator) {
+      return;
+    }
+
+    this.loadingIndicators.delete(sessionId);
+    if (indicator.activationTimer) {
+      clearTimeout(indicator.activationTimer);
+    }
+    if (indicator.tickTimer) {
+      clearInterval(indicator.tickTimer);
+    }
+
+    if (!indicator.messageId) {
+      return;
+    }
+
+    const state = this.sessionThreads.get(sessionId);
+    if (!state) {
+      return;
+    }
+
+    try {
+      const thread = await this.fetchThread(state.threadId);
+      const message = await thread.messages.fetch(indicator.messageId);
+      await message.delete().catch(() => {});
+    } catch {
+      // non-fatal
+    } finally {
+      this.forgetBotMessage(sessionId, indicator.messageId);
+    }
   }
 }

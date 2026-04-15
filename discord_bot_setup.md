@@ -191,6 +191,21 @@ Check:
 - `DISCORD_GUILD_ID` matches that server
 - give Discord a short moment to finish guild-scoped slash-command registration after startup
 
+### `/dg-reattach` cannot find a session
+
+That command only works for the current in-memory session while the same bot process is still running. It is not a post-restart recovery command.
+
+## Related docs
+
+- `env_setup.md`
+- `README.md`
+Check:
+
+- the bot is in the correct server
+- the invite used `applications.commands`
+- `DISCORD_GUILD_ID` matches that server
+- give Discord a short moment to finish guild-scoped slash-command registration after startup
+
 ## Related docs
 
 - `env_setup.md`

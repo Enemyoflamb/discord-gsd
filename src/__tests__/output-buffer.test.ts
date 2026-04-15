@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 
-import { extractAssistantText, splitIntoDiscordChunks } from "../output-buffer.js";
+import { extractAssistantModelLabel, extractAssistantText, splitIntoDiscordChunks } from "../output-buffer.js";
 
 describe("splitIntoDiscordChunks", () => {
   it("returns a single chunk when the text already fits", () => {
@@ -46,5 +46,33 @@ describe("extractAssistantText", () => {
     } as never);
 
     assert.equal(text, null);
+  });
+});
+
+describe("extractAssistantModelLabel", () => {
+  it("extracts provider/model from assistant messages", () => {
+    const label = extractAssistantModelLabel({
+      type: "message_end",
+      message: {
+        role: "assistant",
+        provider: "anthropic",
+        model: "claude-sonnet-4-20250514",
+        content: [{ type: "text", text: "Final answer" }],
+      },
+    } as never);
+
+    assert.equal(label, "anthropic/claude-sonnet-4-20250514");
+  });
+
+  it("returns null when no model metadata is present", () => {
+    const label = extractAssistantModelLabel({
+      type: "message_end",
+      message: {
+        role: "assistant",
+        content: [{ type: "text", text: "Final answer" }],
+      },
+    } as never);
+
+    assert.equal(label, null);
   });
 });

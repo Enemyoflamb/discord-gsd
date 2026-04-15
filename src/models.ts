@@ -24,6 +24,7 @@ export interface ManagedSession {
   projectDir: string;
   projectName: string;
   status: SessionStatus;
+  isStreaming: boolean;
   client: RpcClient;
   events: SdkAgentEvent[];
   pendingBlocker: PendingBlocker | null;

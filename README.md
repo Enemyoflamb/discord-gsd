@@ -92,6 +92,55 @@ Inside the session thread, just reply normally. The bot will:
 For select blockers, reply with the option number.
 For confirm blockers, reply with `yes` or `no`.
 
+### Reattach the current session
+
+If the thread mapping drifts, use:
+
+```text
+/dg-reattach
+```
+
+Behavior:
+- if you run it inside a thread, the current in-memory session is rebound to that thread
+- if you run it outside a thread, the bot creates a fresh thread and rebinds the current in-memory session there
+
+## Thinking / progress visibility
+
+While GSD is still running a turn:
+
+- a spinner-style status message appears in the thread after a short delay
+- the spinner updates every 5 seconds
+
+If the active model/provider exposes reasoning text in the event stream, the bot also posts thinking transcript chunks in 500-character blocks:
+
+```text
+[Thinking 1 · provider/model]
+...
+```
+
+Not all models/providers expose this. If no thinking transcript appears, that may be a provider limitation rather than a bot problem.
+
+## Session lifecycle
+
+A GSD **session** is not the same thing as a single reply.
+
+Current model:
+
+- one active in-memory GSD session per `GSD_PROJECT_DIR`
+- `/dg` starts it if needed
+- later `/dg` calls and thread replies reuse that same session
+- each user message creates a new turn inside that session
+
+The session ends when:
+
+- `discord-gsd` shuts down
+- the GSD/RPC child process errors out
+- the controller tears it down and recreates it after failure
+
+Sessions are currently **in-memory and process-bound**. `/dg-reattach` works only while the same bot process is still alive; it is not full post-restart session recovery.
+
+When the service shuts down cleanly or the session errors out, the bot posts a close/failure notice into the thread so the user knows the session is no longer attachable.
+
 ## Runtime model
 
 `discord-gsd` assumes it is running in the same runtime/container as `gsd` and Claude Code.

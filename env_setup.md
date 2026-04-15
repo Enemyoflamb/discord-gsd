@@ -151,3 +151,13 @@ Guild-scoped slash command registration can take a short moment after startup. I
 - bot token belongs to the same application you invited
 - correct `DISCORD_GUILD_ID`
 - `applications.commands` scope was included in the invite
+
+### `/dg-reattach` says there is no active session
+That command only works while the same bot process still has an in-memory session. It does not resurrect an old session after a full restart.
+igured parent channel
+
+### Bot starts but `/dg` does not appear
+Guild-scoped slash command registration can take a short moment after startup. If it never appears, re-check:
+- bot token belongs to the same application you invited
+- correct `DISCORD_GUILD_ID`
+- `applications.commands` scope was included in the invite
