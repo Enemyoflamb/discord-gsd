@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 
-import { extractAssistantModelLabel, extractAssistantText, splitIntoDiscordChunks } from "../output-buffer.js";
+import { extractAssistantModelLabel, extractAssistantText, extractShellCommandActivity, formatShellCommandMessages, splitIntoDiscordChunks } from "../output-buffer.js";
 
 describe("splitIntoDiscordChunks", () => {
   it("returns a single chunk when the text already fits", () => {
@@ -20,6 +20,94 @@ describe("splitIntoDiscordChunks", () => {
     const text = "x".repeat(35);
     const chunks = splitIntoDiscordChunks(text, 10);
     assert.deepEqual(chunks.map((chunk) => chunk.length), [10, 10, 10, 5]);
+  });
+});
+
+describe("extractShellCommandActivity", () => {
+  it("extracts bash tool execution starts", () => {
+    const activity = extractShellCommandActivity({
+      type: "tool_execution_start",
+      toolCallId: "toolu_1",
+      toolName: "bash",
+      args: { command: "npm test" },
+    } as never);
+
+    assert.deepEqual(activity, {
+      toolCallId: "toolu_1",
+      toolName: "bash",
+      label: "bash",
+      command: "npm test",
+    });
+  });
+
+  it("supports legacy input payloads", () => {
+    const activity = extractShellCommandActivity({
+      type: "tool_execution_start",
+      toolCallId: "toolu_2",
+      toolName: "async_bash",
+      input: { command: "npm run build" },
+    } as never);
+
+    assert.deepEqual(activity, {
+      toolCallId: "toolu_2",
+      toolName: "async_bash",
+      label: "async_bash",
+      command: "npm run build",
+    });
+  });
+
+  it("extracts bg_shell run actions with a command", () => {
+    const activity = extractShellCommandActivity({
+      type: "tool_execution_start",
+      toolCallId: "toolu_3",
+      toolName: "bg_shell",
+      args: { action: "run", command: "pnpm dev" },
+    } as never);
+
+    assert.deepEqual(activity, {
+      toolCallId: "toolu_3",
+      toolName: "bg_shell",
+      label: "bg_shell:run",
+      command: "pnpm dev",
+    });
+  });
+
+  it("ignores non-command tool activity", () => {
+    const activity = extractShellCommandActivity({
+      type: "tool_execution_start",
+      toolCallId: "toolu_4",
+      toolName: "read",
+      args: { path: "README.md" },
+    } as never);
+
+    assert.equal(activity, null);
+  });
+});
+
+describe("formatShellCommandMessages", () => {
+  it("formats machine activity as a plain Discord message with a code block", () => {
+    const messages = formatShellCommandMessages({
+      toolCallId: "toolu_5",
+      toolName: "bash",
+      label: "bash",
+      command: "npm test",
+    }, 200);
+
+    assert.deepEqual(messages, ["[Machine · bash]\n```bash\nnpm test\n```"]);
+  });
+
+  it("splits long commands into multiple Discord-safe parts", () => {
+    const messages = formatShellCommandMessages({
+      toolCallId: "toolu_6",
+      toolName: "bash",
+      label: "bash",
+      command: "echo " + "x".repeat(120),
+    }, 90);
+
+    assert.ok(messages.length > 1);
+    assert.ok(messages.every((message) => message.length <= 90));
+    assert.ok(messages[0]);
+    assert.match(messages[0], /\[Machine · bash\] · 1\//);
   });
 });
 

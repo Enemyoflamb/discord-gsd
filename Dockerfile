@@ -12,7 +12,6 @@ COPY .env.example .
 COPY .dockerignore .
 
 RUN npm run build \
-  && npm prune --omit=dev \
-  && npm install -g gsd-pi@latest
+  && npm prune --omit=dev
 
 CMD ["node", "dist/index.js"]

@@ -23,6 +23,7 @@ export interface ManagedSession {
   sessionId: string;
   projectDir: string;
   projectName: string;
+  cliPath: string;
   status: SessionStatus;
   isStreaming: boolean;
   client: RpcClient;
@@ -36,6 +37,8 @@ export interface ManagedSession {
 
 export interface SessionThreadState {
   sessionId: string;
+  projectDir: string;
+  projectName: string;
   threadId: string;
   starterMessageId: string;
   lastBotMessageIds: Set<string>;

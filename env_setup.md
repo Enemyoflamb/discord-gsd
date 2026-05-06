@@ -94,11 +94,15 @@ Use the path that exists from the app's point of view.
 
 ## 6. Confirm `gsd` is available
 
+After `npm install`, this repo now carries a pinned local `gsd-pi` version. `discord-gsd` prefers that local binary automatically.
+
+You can still check a global install with:
+
 ```bash
 gsd --help
 ```
 
-If that fails, set:
+If you want to override the repo-local version, set:
 
 ```env
 GSD_CLI_PATH=/absolute/path/to/gsd

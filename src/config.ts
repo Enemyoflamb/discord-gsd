@@ -11,6 +11,7 @@ export interface AppConfig {
   gsdProjectDir: string;
   gsdCliPath?: string;
   gsdModel?: string;
+  gsdHome?: string;
   gsdBare: boolean;
   discordMessageChunkSize: number;
   logLevel: LogLevel;
@@ -93,6 +94,11 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   const gsdModel = optional("GSD_MODEL", env);
   if (gsdModel) {
     config.gsdModel = gsdModel;
+  }
+
+  const gsdHome = optional("GSD_HOME", env);
+  if (gsdHome) {
+    config.gsdHome = gsdHome;
   }
 
   return config;

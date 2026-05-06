@@ -1,7 +1,20 @@
 import type { PendingBlocker } from "./models.js";
 
+export interface BlockerUiResponse {
+  value?: string;
+  values?: string[];
+  confirmed?: boolean;
+  cancelled?: boolean;
+}
+
 function eventRecord(blocker: PendingBlocker): Record<string, unknown> {
   return blocker.event as Record<string, unknown>;
+}
+
+function selectOptions(blocker: PendingBlocker): string[] {
+  return Array.isArray(eventRecord(blocker).options)
+    ? (eventRecord(blocker).options as unknown[]).filter((value): value is string => typeof value === "string")
+    : [];
 }
 
 export function formatBlockerMessage(blocker: PendingBlocker): string {
@@ -9,12 +22,13 @@ export function formatBlockerMessage(blocker: PendingBlocker): string {
 
   switch (blocker.method) {
     case "select": {
-      const options = Array.isArray(eventRecord(blocker).options)
-        ? (eventRecord(blocker).options as unknown[]).filter((value): value is string => typeof value === "string")
-        : [];
-
+      const options = selectOptions(blocker);
       const lines = options.map((option, index) => `${index + 1}. ${option}`);
-      return `${header}\n\nReply with the option number.\n${lines.join("\n")}`.trim();
+      const allowMultiple = eventRecord(blocker).allowMultiple === true;
+      const instructions = allowMultiple
+        ? "Reply with one or more option numbers separated by commas."
+        : "Reply with the option number.";
+      return `${header}\n\n${instructions}\n${lines.join("\n")}`.trim();
     }
 
     case "confirm":
@@ -35,7 +49,7 @@ export function formatBlockerMessage(blocker: PendingBlocker): string {
   }
 }
 
-export function normalizeBlockerReply(blocker: PendingBlocker, reply: string): string {
+export function buildBlockerUiResponse(blocker: PendingBlocker, reply: string): BlockerUiResponse {
   const trimmed = reply.trim();
   if (!trimmed) {
     throw new Error("Reply was empty.");
@@ -43,32 +57,43 @@ export function normalizeBlockerReply(blocker: PendingBlocker, reply: string): s
 
   switch (blocker.method) {
     case "select": {
-      const options = Array.isArray(eventRecord(blocker).options)
-        ? (eventRecord(blocker).options as unknown[]).filter((value): value is string => typeof value === "string")
-        : [];
-      const match = trimmed.match(/\d+/);
-      if (!match) {
+      const options = selectOptions(blocker);
+      const allowMultiple = eventRecord(blocker).allowMultiple === true;
+      const matches = [...trimmed.matchAll(/\d+/g)].map((match) => Number.parseInt(match[0], 10));
+      if (matches.length === 0) {
         throw new Error("Select blockers require a numeric reply like `1`.");
       }
-      const oneBasedIndex = Number.parseInt(match[0], 10);
-      if (!Number.isFinite(oneBasedIndex) || oneBasedIndex < 1 || oneBasedIndex > options.length) {
-        throw new Error(`Reply must be between 1 and ${options.length}.`);
+
+      const labels = matches.map((oneBasedIndex) => {
+        if (!Number.isFinite(oneBasedIndex) || oneBasedIndex < 1 || oneBasedIndex > options.length) {
+          throw new Error(`Reply must be between 1 and ${options.length}.`);
+        }
+        return options[oneBasedIndex - 1] as string;
+      });
+
+      if (allowMultiple) {
+        return { values: [...new Set(labels)] };
       }
-      return String(oneBasedIndex - 1);
+
+      const label = labels[0];
+      if (!label) {
+        throw new Error("No option could be resolved from the reply.");
+      }
+      return { value: label };
     }
 
     case "confirm": {
       const normalized = trimmed.toLowerCase();
       if (["yes", "y", "true", "1"].includes(normalized)) {
-        return "true";
+        return { confirmed: true };
       }
       if (["no", "n", "false", "0"].includes(normalized)) {
-        return "false";
+        return { confirmed: false };
       }
       throw new Error("Confirm blockers require yes or no.");
     }
 
     default:
-      return trimmed;
+      return { value: trimmed };
   }
 }

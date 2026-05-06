@@ -5,6 +5,13 @@ export interface BufferedAssistantOutput {
   modelLabel?: string;
 }
 
+export interface ShellCommandActivity {
+  toolCallId: string;
+  toolName: string;
+  label: string;
+  command: string;
+}
+
 interface BufferedOutputState {
   latestAssistantText?: string;
   latestModelLabel?: string;
@@ -105,6 +112,73 @@ export function extractAssistantModelLabel(event: SdkAgentEvent): string | null 
   }
 
   return null;
+}
+
+function extractToolArgs(event: Record<string, unknown>): Record<string, unknown> | null {
+  const value = event.args && typeof event.args === "object"
+    ? event.args
+    : event.input && typeof event.input === "object"
+      ? event.input
+      : null;
+
+  return value ? value as Record<string, unknown> : null;
+}
+
+export function extractShellCommandActivity(event: SdkAgentEvent): ShellCommandActivity | null {
+  const record = event as Record<string, unknown>;
+  if (record.type !== "tool_execution_start") {
+    return null;
+  }
+
+  const toolName = typeof record.toolName === "string" ? record.toolName.trim() : "";
+  const toolCallId = typeof record.toolCallId === "string" ? record.toolCallId : "";
+  const args = extractToolArgs(record);
+  if (!toolName || !toolCallId || !args) {
+    return null;
+  }
+
+  const command = typeof args.command === "string" ? args.command.trim() : "";
+  if ((toolName === "bash" || toolName === "async_bash") && command) {
+    return {
+      toolCallId,
+      toolName,
+      label: toolName,
+      command,
+    };
+  }
+
+  if (toolName === "bg_shell") {
+    const action = typeof args.action === "string" ? args.action.trim() : "";
+    if (!command || !["start", "run", "restart"].includes(action)) {
+      return null;
+    }
+
+    return {
+      toolCallId,
+      toolName,
+      label: `bg_shell:${action}`,
+      command,
+    };
+  }
+
+  return null;
+}
+
+function escapeDiscordCodeFence(text: string): string {
+  return text.replaceAll("```", "``\u200b`");
+}
+
+export function formatShellCommandMessages(activity: ShellCommandActivity, maxLength = 1500): string[] {
+  const baseHeader = `[Machine · ${activity.label}]`;
+  const reservedLength = baseHeader.length + " · 99/99\n```bash\n\n```".length;
+  const chunks = splitIntoDiscordChunks(activity.command, Math.max(1, maxLength - reservedLength));
+
+  return chunks.map((chunk, index) => {
+    const header = chunks.length > 1
+      ? `${baseHeader} · ${index + 1}/${chunks.length}`
+      : baseHeader;
+    return `${header}\n\`\`\`bash\n${escapeDiscordCodeFence(chunk)}\n\`\`\``;
+  });
 }
 
 export function splitIntoDiscordChunks(text: string, maxLength = 1500): string[] {

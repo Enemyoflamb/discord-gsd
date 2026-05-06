@@ -1,7 +1,9 @@
-import { basename } from "node:path";
+import { existsSync } from "node:fs";
+import { basename, join } from "node:path";
 
 import {
   AnyThreadChannel,
+  AutocompleteInteraction,
   ChannelType,
   ChatInputCommandInteraction,
   Client,
@@ -28,39 +30,172 @@ import type {
   SessionThreadState,
 } from "./models.js";
 import { formatBlockerMessage } from "./blockers.js";
-import { FinalOutputStore, extractAssistantModelLabel, splitIntoDiscordChunks } from "./output-buffer.js";
+import {
+  FinalOutputStore,
+  extractAssistantModelLabel,
+  extractShellCommandActivity,
+  formatShellCommandMessages,
+  splitIntoDiscordChunks,
+} from "./output-buffer.js";
+import {
+  buildGsdCommandInput,
+  getGsdArgsAutocompleteChoices,
+  getGsdAutocompleteChoices,
+} from "./gsd-command-catalog.js";
+import {
+  createProject,
+  findProject,
+  formatProjectList,
+  listProjects,
+  markProjectUsed,
+  removeProject,
+  renameProject,
+  type ProjectRecord,
+} from "./project-registry.js";
+import { normalizeRelayInput } from "./relay-input.js";
 import { buildThreadName, resolveRelayTarget } from "./routing.js";
 import { SessionController } from "./session-controller.js";
 
 const DG_COMMAND = new SlashCommandBuilder()
   .setName("dg")
-  .setDescription("Relay a prompt or /gsd command into the configured GSD session")
+  .setDescription("Create, select, and list Discord-managed GSD projects")
+  .addSubcommand((subcommand) =>
+    subcommand
+      .setName("create")
+      .setDescription("Create and register a new project directory")
+      .addStringOption((option) =>
+        option
+          .setName("project")
+          .setDescription("Project name to create")
+          .setRequired(true),
+      ),
+  )
+  .addSubcommand((subcommand) =>
+    subcommand
+      .setName("project")
+      .setDescription("Open or continue work on a registered project")
+      .addStringOption((option) =>
+        option
+          .setName("project")
+          .setDescription("Registered project id")
+          .setAutocomplete(true)
+          .setRequired(true),
+      )
+      .addStringOption((option) =>
+        option
+          .setName("prompt")
+          .setDescription("Optional prompt to send after opening the project")
+          .setRequired(false),
+      ),
+  )
+  .addSubcommand((subcommand) =>
+    subcommand
+      .setName("rename")
+      .setDescription("Rename a registered project without moving its directory")
+      .addStringOption((option) =>
+        option
+          .setName("project")
+          .setDescription("Registered project id")
+          .setAutocomplete(true)
+          .setRequired(true),
+      )
+      .addStringOption((option) =>
+        option
+          .setName("name")
+          .setDescription("New display name for the project")
+          .setRequired(true),
+      ),
+  )
+  .addSubcommand((subcommand) =>
+    subcommand
+      .setName("remove")
+      .setDescription("Remove a project from projectlist.json without deleting its directory")
+      .addStringOption((option) =>
+        option
+          .setName("project")
+          .setDescription("Registered project id")
+          .setAutocomplete(true)
+          .setRequired(true),
+      ),
+  )
+  .addSubcommand((subcommand) =>
+    subcommand
+      .setName("context")
+      .setDescription("Show available session/context details for a project")
+      .addStringOption((option) =>
+        option
+          .setName("project")
+          .setDescription("Registered project id; defaults to the current thread project")
+          .setAutocomplete(true)
+          .setRequired(false),
+      ),
+  )
+  .addSubcommand((subcommand) =>
+    subcommand
+      .setName("new-context")
+      .setDescription("Start a fresh in-memory session for a project thread")
+      .addStringOption((option) =>
+        option
+          .setName("project")
+          .setDescription("Registered project id; defaults to the current thread project")
+          .setAutocomplete(true)
+          .setRequired(false),
+      ),
+  )
+  .addSubcommand((subcommand) =>
+    subcommand
+      .setName("end")
+      .setDescription("Stop an active in-memory GSD session for a project")
+      .addStringOption((option) =>
+        option
+          .setName("project")
+          .setDescription("Registered project id; defaults to the current thread project")
+          .setAutocomplete(true)
+          .setRequired(false),
+      ),
+  )
+  .addSubcommand((subcommand) =>
+    subcommand
+      .setName("list")
+      .setDescription("List registered projects"),
+  )
+  .toJSON();
+
+const GSD_COMMAND = new SlashCommandBuilder()
+  .setName("gsd")
+  .setDescription("Run a GSD slash command inside the configured GSD session")
   .addStringOption((option) =>
     option
-      .setName("input")
-      .setDescription("Prompt or /gsd command to send")
-      .setRequired(true),
+      .setName("command")
+      .setDescription("Top-level GSD command, like help, auto, or status")
+      .setAutocomplete(true)
+      .setRequired(false),
+  )
+  .addStringOption((option) =>
+    option
+      .setName("args")
+      .setDescription("Optional raw arguments appended after the command")
+      .setRequired(false),
   )
   .toJSON();
 
 const DG_REATTACH_COMMAND = new SlashCommandBuilder()
   .setName("dg-reattach")
-  .setDescription("Reattach the current in-memory GSD session to this thread or a new thread")
+  .setDescription("Reattach an active in-memory GSD session to this thread or a new thread")
+  .addStringOption((option) =>
+    option
+      .setName("project")
+      .setDescription("Registered project id to reattach when multiple sessions are active")
+      .setAutocomplete(true)
+      .setRequired(false),
+  )
   .toJSON();
 
-const THINKING_FRAMES = [
-  "↻ GSD is thinking…",
-  "↺ GSD is thinking…",
-  "⟳ GSD is thinking…",
-  "⟲ GSD is thinking…",
-] as const;
-
-interface LoadingIndicatorState {
-  activationTimer?: ReturnType<typeof setTimeout>;
-  tickTimer?: ReturnType<typeof setInterval>;
-  messageId?: string;
-  frameIndex: number;
-}
+const THINKING_REACTION_FRAMES = ["➡️", "↘️", "⬇️", "↙️", "⬅️", "↖️", "⬆️", "↗️"] as const;
+const THINKING_STATUS_REACTION = "💭";
+const THINKING_REACTION_INTERVAL_MS = 2000;
+const RELAY_COMPLETE_REACTION = "📨";
+const RELAY_ERROR_REACTION = "❌";
 
 interface ThinkingTranscriptState {
   fullText: string;
@@ -69,8 +204,12 @@ interface ThinkingTranscriptState {
   modelLabel?: string;
 }
 
-function thinkingFrame(index: number): string {
-  return THINKING_FRAMES[index % THINKING_FRAMES.length] ?? THINKING_FRAMES[0];
+interface MessageReactionIndicatorState {
+  message: Message;
+  frameIndex: number;
+  currentEmoji?: string;
+  statusEmoji?: string;
+  timer: ReturnType<typeof setInterval>;
 }
 
 function extractThinkingText(source: unknown): string {
@@ -119,6 +258,13 @@ function describeDiscordStartupError(error: unknown, config: AppConfig): string 
   return message;
 }
 
+/** Discord error code 10062 = interaction token expired or already consumed. */
+function isExpiredInteraction(error: unknown): boolean {
+  if (typeof error !== "object" || error === null) return false;
+  const code = (error as { code?: unknown }).code;
+  return code === 10062 || code === "10062";
+}
+
 export class DiscordGsdService {
   private readonly client: Client;
   private readonly outputStore = new FinalOutputStore();
@@ -126,8 +272,10 @@ export class DiscordGsdService {
   private readonly threadToSession = new Map<string, string>();
   private readonly messageToSession = new Map<string, string>();
   private readonly pendingThreadByProject = new Map<string, SessionThreadState>();
-  private readonly loadingIndicators = new Map<string, LoadingIndicatorState>();
   private readonly thinkingStreams = new Map<string, ThinkingTranscriptState>();
+  private readonly streamedShellCommands = new Map<string, Set<string>>();
+  private readonly reactionIndicators = new Map<string, MessageReactionIndicatorState>();
+  private readonly lastOutboundText = new Map<string, string>();
 
   constructor(
     private readonly config: AppConfig,
@@ -180,8 +328,9 @@ export class DiscordGsdService {
     const sessionIds = [...this.sessionThreads.keys()];
 
     for (const sessionId of sessionIds) {
-      await this.stopLoadingIndicator(sessionId);
+      await this.stopReactionIndicator(sessionId);
       await this.flushRemainingThinking(sessionId);
+      this.streamedShellCommands.delete(sessionId);
     }
 
     await Promise.allSettled(sessionIds.map((sessionId) =>
@@ -248,11 +397,11 @@ export class DiscordGsdService {
     const rest = new REST({ version: "10" }).setToken(this.config.discordBotToken);
     await rest.put(
       Routes.applicationGuildCommands(applicationId, this.config.discordGuildId),
-      { body: [DG_COMMAND, DG_REATTACH_COMMAND] },
+      { body: [DG_COMMAND, GSD_COMMAND, DG_REATTACH_COMMAND] },
     );
     this.logger.info("discord slash commands registered", {
       guildId: this.config.discordGuildId,
-      commandCount: 2,
+      commandCount: 3,
     });
   }
 
@@ -268,42 +417,475 @@ export class DiscordGsdService {
   }
 
   private async onInteraction(interaction: Interaction): Promise<void> {
+    if (interaction.isAutocomplete()) {
+      await this.handleAutocomplete(interaction);
+      return;
+    }
+
     if (!interaction.isChatInputCommand()) {
       return;
     }
 
     if (!this.isAuthorized(interaction.user.id)) {
-      await interaction.reply({ content: "You are not allowed to use this bot.", flags: MessageFlags.Ephemeral });
+      await interaction.reply({ content: "You are not allowed to use this bot.", flags: MessageFlags.Ephemeral }).catch(() => {});
       return;
     }
 
+    try {
+      if (interaction.commandName === "dg") {
+        await this.handleDgCommand(interaction);
+        return;
+      }
+
+      if (interaction.commandName === "gsd") {
+        await this.handleGsdCommand(interaction);
+        return;
+      }
+
+      if (interaction.commandName === "dg-reattach") {
+        await this.handleReattachCommand(interaction);
+      }
+    } catch (error) {
+      // Discord returns 10062 (Unknown interaction) when the 3-second or
+      // 15-minute interaction token expires. This is not actionable — log
+      // and move on instead of crashing the process.
+      if (isExpiredInteraction(error)) {
+        this.logger.warn("interaction expired before response", {
+          command: interaction.commandName,
+          error: error instanceof Error ? error.message : String(error),
+        });
+        return;
+      }
+      throw error;
+    }
+  }
+
+  private async handleAutocomplete(interaction: AutocompleteInteraction): Promise<void> {
+    if (!this.isAuthorized(interaction.user.id)) {
+      await interaction.respond([]).catch(() => {});
+      return;
+    }
+
+    const focused = interaction.options.getFocused(true);
+    const value = typeof focused.value === "string" ? focused.value : String(focused.value ?? "");
+
     if (interaction.commandName === "dg") {
-      await this.handleDgCommand(interaction);
+      const subcommand = interaction.options.getSubcommand(false);
+      if (subcommand && ["project", "rename", "remove", "end", "context", "new-context"].includes(subcommand) && focused.name === "project") {
+        const normalized = value.trim().toLowerCase();
+        const choices = listProjects(this.config.gsdProjectDir)
+          .filter((project) => !normalized || project.id.startsWith(normalized) || project.name.toLowerCase().startsWith(normalized))
+          .slice(0, 25)
+          .map((project) => ({
+            name: `${project.id} — ${project.name}`.slice(0, 100),
+            value: project.id,
+          }));
+        await interaction.respond(choices).catch(() => {});
+        return;
+      }
+
+      await interaction.respond([]).catch(() => {});
       return;
     }
 
     if (interaction.commandName === "dg-reattach") {
-      await this.handleReattachCommand(interaction);
-    }
-  }
+      if (focused.name === "project") {
+        const normalized = value.trim().toLowerCase();
+        const choices = listProjects(this.config.gsdProjectDir)
+          .filter((project) => !normalized || project.id.startsWith(normalized) || project.name.toLowerCase().startsWith(normalized))
+          .slice(0, 25)
+          .map((project) => ({
+            name: `${project.id} — ${project.name}`.slice(0, 100),
+            value: project.id,
+          }));
+        await interaction.respond(choices).catch(() => {});
+        return;
+      }
 
-  private async handleDgCommand(interaction: ChatInputCommandInteraction): Promise<void> {
-    const input = interaction.options.getString("input", true).trim();
-    if (!input) {
-      await interaction.reply({ content: "Input cannot be empty.", flags: MessageFlags.Ephemeral });
+      await interaction.respond([]).catch(() => {});
       return;
     }
 
-    const activeChannelId = interaction.channelId;
-    const activeThreadSession = this.threadToSession.get(activeChannelId);
-    const threadState = activeThreadSession
-      ? this.sessionThreads.get(activeThreadSession) ?? null
-      : await this.getOrCreatePendingThread(input);
+    if (interaction.commandName !== "gsd") {
+      await interaction.respond([]).catch(() => {});
+      return;
+    }
+
+    if (focused.name === "command") {
+      await interaction.respond(getGsdAutocompleteChoices(value)).catch(() => {});
+      return;
+    }
+
+    if (focused.name === "args") {
+      const command = interaction.options.getString("command");
+      const autocompleteContext = {
+        projectDir: this.getActiveProjectDirForChannel(interaction.channelId) ?? this.config.gsdProjectDir,
+        ...(this.config.gsdHome ? { gsdHome: this.config.gsdHome } : {}),
+      };
+      await interaction.respond(getGsdArgsAutocompleteChoices(command, value, autocompleteContext)).catch(() => {});
+      return;
+    }
+
+    await interaction.respond([]).catch(() => {});
+  }
+
+  private async handleDgCommand(interaction: ChatInputCommandInteraction): Promise<void> {
+    const subcommand = interaction.options.getSubcommand(true);
+
+    if (subcommand === "list") {
+      await this.handleProjectListCommand(interaction);
+      return;
+    }
+
+    if (subcommand === "create") {
+      await this.handleProjectCreateCommand(interaction);
+      return;
+    }
+
+    if (subcommand === "project") {
+      await this.handleProjectOpenCommand(interaction);
+      return;
+    }
+
+    if (subcommand === "rename") {
+      await this.handleProjectRenameCommand(interaction);
+      return;
+    }
+
+    if (subcommand === "remove") {
+      await this.handleProjectRemoveCommand(interaction);
+      return;
+    }
+
+    if (subcommand === "end") {
+      await this.handleProjectEndCommand(interaction);
+      return;
+    }
+
+    if (subcommand === "context") {
+      await this.handleProjectContextCommand(interaction);
+      return;
+    }
+
+    if (subcommand === "new-context") {
+      await this.handleProjectNewContextCommand(interaction);
+      return;
+    }
+  }
+
+  private async handleProjectListCommand(interaction: ChatInputCommandInteraction): Promise<void> {
+    const projects = listProjects(this.config.gsdProjectDir);
+    await interaction.reply({
+      content: formatProjectList(projects),
+      flags: MessageFlags.Ephemeral,
+    }).catch(() => {});
+  }
+
+  private async handleProjectCreateCommand(interaction: ChatInputCommandInteraction): Promise<void> {
+    const requestedName = interaction.options.getString("project", true);
+
+    try {
+      const project = createProject(this.config.gsdProjectDir, requestedName);
+      await interaction.reply({
+        content: [
+          `Created project \`${project.id}\` (${project.name}).`,
+          `Path: \`${project.path}\``,
+          `Run \`/dg project project:${project.id}\` to start working on it.`,
+        ].join("\n"),
+        flags: MessageFlags.Ephemeral,
+      }).catch(() => {});
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      await interaction.reply({
+        content: `Failed to create project: ${message}`,
+        flags: MessageFlags.Ephemeral,
+      }).catch(() => {});
+    }
+  }
+
+  private async handleProjectOpenCommand(interaction: ChatInputCommandInteraction): Promise<void> {
+    const requestedProject = interaction.options.getString("project", true);
+    const project = findProject(this.config.gsdProjectDir, requestedProject);
+    if (!project) {
+      await interaction.reply({
+        content: `Unknown project: ${requestedProject}. Use \`/dg list\` to see registered projects.`,
+        flags: MessageFlags.Ephemeral,
+      }).catch(() => {});
+      return;
+    }
+
+    const prompt = interaction.options.getString("prompt")?.trim() || this.defaultProjectPrompt(project);
+    await this.handleRelayCommand(interaction, project, prompt, {
+      startedSessionMessage: "Started session for",
+      successReply: `Working on \`${project.id}\` in this thread.`,
+    });
+  }
+
+  private async handleProjectRenameCommand(interaction: ChatInputCommandInteraction): Promise<void> {
+    const requestedProject = interaction.options.getString("project", true);
+    const nextName = interaction.options.getString("name", true);
+
+    try {
+      const renamed = renameProject(this.config.gsdProjectDir, requestedProject, nextName);
+
+      for (const state of this.sessionThreads.values()) {
+        if (state.projectDir === renamed.path) {
+          state.projectName = renamed.name;
+        }
+      }
+      for (const state of this.pendingThreadByProject.values()) {
+        if (state.projectDir === renamed.path) {
+          state.projectName = renamed.name;
+        }
+      }
+
+      await interaction.reply({
+        content: [
+          `Renamed project \`${renamed.id}\` to ${renamed.name}.`,
+          `Directory remains \`${renamed.path}\`.`,
+        ].join("\n"),
+        flags: MessageFlags.Ephemeral,
+      }).catch(() => {});
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      await interaction.reply({
+        content: `Failed to rename project: ${message}`,
+        flags: MessageFlags.Ephemeral,
+      }).catch(() => {});
+    }
+  }
+
+  private async handleProjectRemoveCommand(interaction: ChatInputCommandInteraction): Promise<void> {
+    const requestedProject = interaction.options.getString("project", true);
+    const project = findProject(this.config.gsdProjectDir, requestedProject);
+    if (!project) {
+      await interaction.reply({
+        content: `Unknown project: ${requestedProject}. Use \`/dg list\` to see registered projects.`,
+        flags: MessageFlags.Ephemeral,
+      }).catch(() => {});
+      return;
+    }
+
+    const activeSession = this.controller.getProjectSession(project.path);
+    if (activeSession) {
+      await interaction.reply({
+        content: `Cannot remove \`${project.id}\` while it still has an active in-memory session.`,
+        flags: MessageFlags.Ephemeral,
+      }).catch(() => {});
+      return;
+    }
+
+    if (this.pendingThreadByProject.has(project.path)) {
+      await interaction.reply({
+        content: `Cannot remove \`${project.id}\` while its Discord thread is still being attached.`,
+        flags: MessageFlags.Ephemeral,
+      }).catch(() => {});
+      return;
+    }
+
+    try {
+      const removed = removeProject(this.config.gsdProjectDir, requestedProject);
+      await interaction.reply({
+        content: [
+          `Removed project \`${removed.id}\` from projectlist.json.`,
+          `Directory left in place at \`${removed.path}\`.`,
+        ].join("\n"),
+        flags: MessageFlags.Ephemeral,
+      }).catch(() => {});
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      await interaction.reply({
+        content: `Failed to remove project: ${message}`,
+        flags: MessageFlags.Ephemeral,
+      }).catch(() => {});
+    }
+  }
+
+  private async handleProjectEndCommand(interaction: ChatInputCommandInteraction): Promise<void> {
+    const requestedProject = interaction.options.getString("project")?.trim();
+    const project = this.resolveProjectForSessionCommand(interaction);
+    if (!project) {
+      await interaction.reply({
+        content: requestedProject
+          ? `Unknown project: ${requestedProject}. Use \`/dg list\` to see registered projects.`
+          : "No project is bound to this channel, and there is no single active session to end.",
+        flags: MessageFlags.Ephemeral,
+      }).catch(() => {});
+      return;
+    }
+
+    const session = this.controller.getProjectSession(project.path);
+    if (!session) {
+      await interaction.reply({
+        content: `No active in-memory GSD session is running for \`${project.id}\`.`,
+        flags: MessageFlags.Ephemeral,
+      }).catch(() => {});
+      return;
+    }
+
+    const hadThreadBinding = this.sessionThreads.has(session.sessionId);
 
     await interaction.deferReply({ flags: MessageFlags.Ephemeral });
 
     try {
-      const dispatch = await this.controller.dispatch(input);
+      if (hadThreadBinding) {
+        await this.sendToSession(session.sessionId, "🛑 Ended this GSD session.");
+      }
+
+      const ended = await this.controller.endProjectSession(project.path);
+      if (!ended) {
+        await interaction.editReply({ content: `No active in-memory GSD session is running for \`${project.id}\`.` });
+        return;
+      }
+
+      await this.cleanupEndedSession(ended.sessionId, ended.projectDir);
+      await interaction.editReply({ content: `Ended the GSD session for \`${project.id}\`.` });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.logger.error("project end failed", { projectDir: project.path, error: message });
+      await interaction.editReply({ content: `Failed to end the GSD session: ${message}` });
+    }
+  }
+
+  private async handleProjectContextCommand(interaction: ChatInputCommandInteraction): Promise<void> {
+    const requestedProject = interaction.options.getString("project")?.trim();
+    const project = this.resolveProjectForSessionCommand(interaction);
+    if (!project) {
+      await interaction.reply({
+        content: requestedProject
+          ? `Unknown project: ${requestedProject}. Use \`/dg list\` to see registered projects.`
+          : "No project is bound to this channel, and there is no single active session to inspect.",
+        flags: MessageFlags.Ephemeral,
+      }).catch(() => {});
+      return;
+    }
+
+    const details = await this.controller.inspectProjectSession(project.path);
+    if (!details) {
+      await interaction.reply({
+        content: `No active in-memory GSD session is running for \`${project.id}\`.`,
+        flags: MessageFlags.Ephemeral,
+      }).catch(() => {});
+      return;
+    }
+
+    const modelLabel = details.state.model
+      ? `${details.state.model.provider}/${details.state.model.id}`
+      : "unknown";
+    const contextWindow = details.state.model?.contextWindow;
+    const contextWindowText = typeof contextWindow === "number" && contextWindow > 0
+      ? contextWindow.toLocaleString()
+      : "unknown";
+
+    await interaction.reply({
+      content: [
+        `Context — \`${project.id}\``,
+        "",
+        `Model: ${modelLabel}`,
+        `Context window: ${contextWindowText}`,
+        "Current context usage: not exposed by the current GSD RPC interface.",
+        `Cumulative session tokens: ${details.stats.tokens.total.toLocaleString()}`,
+        `Pending queued messages: ${details.state.pendingMessageCount}`,
+        `Streaming now: ${details.state.isStreaming ? "yes" : "no"}`,
+      ].join("\n"),
+      flags: MessageFlags.Ephemeral,
+    }).catch(() => {});
+  }
+
+  private async handleProjectNewContextCommand(interaction: ChatInputCommandInteraction): Promise<void> {
+    const requestedProject = interaction.options.getString("project")?.trim();
+    const project = this.resolveProjectForSessionCommand(interaction);
+    if (!project) {
+      await interaction.reply({
+        content: requestedProject
+          ? `Unknown project: ${requestedProject}. Use \`/dg list\` to see registered projects.`
+          : "No project is bound to this channel, and there is no single active session to reset.",
+        flags: MessageFlags.Ephemeral,
+      }).catch(() => {});
+      return;
+    }
+
+    const existing = this.controller.getProjectSession(project.path);
+    if (!existing) {
+      await interaction.reply({
+        content: `No active in-memory GSD session is running for \`${project.id}\`. Use \`/dg project project:${project.id}\` first.`,
+        flags: MessageFlags.Ephemeral,
+      }).catch(() => {});
+      return;
+    }
+
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+
+    try {
+      const result = await this.controller.startNewContext(project.path);
+      if (!result) {
+        await interaction.editReply({ content: `No active in-memory GSD session is running for \`${project.id}\`.` });
+        return;
+      }
+      if (result.cancelled) {
+        await interaction.editReply({ content: `Starting a new context for \`${project.id}\` was cancelled.` });
+        return;
+      }
+
+      await this.rebindSessionContext(result.previousSessionId, result.session);
+      markProjectUsed(this.config.gsdProjectDir, result.session.projectDir);
+      await this.sendToSession(result.session.sessionId, "🪟 Started a fresh GSD context window for this project.");
+      await interaction.editReply({ content: `Started a fresh context window for \`${project.id}\`.` });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.logger.error("project new-context failed", { projectDir: project.path, error: message });
+      await interaction.editReply({ content: `Failed to start a new context window: ${message}` });
+    }
+  }
+
+  private async handleGsdCommand(interaction: ChatInputCommandInteraction): Promise<void> {
+    const project = this.resolveProjectForInteraction(interaction);
+    if (!project) {
+      await interaction.reply({
+        content: "No project is bound to this channel. Use `/dg project` first, then run `/gsd` inside that project thread.",
+        flags: MessageFlags.Ephemeral,
+      }).catch(() => {});
+      return;
+    }
+
+    let input: string;
+    try {
+      input = buildGsdCommandInput(
+        interaction.options.getString("command"),
+        interaction.options.getString("args"),
+      );
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      await interaction.reply({ content: message, flags: MessageFlags.Ephemeral }).catch(() => {});
+      return;
+    }
+
+    await this.handleRelayCommand(interaction, project, input, {
+      startedSessionMessage: "Started GSD session for",
+      successReply: "Ran GSD command in this thread.",
+    });
+  }
+
+  private async handleRelayCommand(
+    interaction: ChatInputCommandInteraction,
+    project: ProjectRecord,
+    input: string,
+    messages: { startedSessionMessage: string; successReply: string },
+  ): Promise<void> {
+    // Defer immediately — Discord requires a response within 3 seconds.
+    // Everything else (thread creation, session dispatch) happens after.
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+
+    const activeChannelId = interaction.channelId;
+    const activeThreadState = this.getThreadStateForChannel(activeChannelId);
+
+    try {
+      const threadState = activeThreadState?.projectDir === project.path
+        ? activeThreadState
+        : await this.getOrCreatePendingThread(project.path, project.name, input);
+
+      const dispatch = await this.controller.dispatch(project.path, input);
+      markProjectUsed(this.config.gsdProjectDir, dispatch.session.projectDir);
       const mapped = await this.ensureSessionThreadState(
         dispatch.session.sessionId,
         dispatch.session.projectDir,
@@ -312,33 +894,131 @@ export class DiscordGsdService {
       );
 
       if (dispatch.startedFresh) {
-        await this.sendToSession(mapped.sessionId, `Started session for \`${dispatch.session.projectName}\`. Reply here or use \`/dg\` again.`);
+        await this.sendToSession(mapped.sessionId, `${messages.startedSessionMessage} \`${dispatch.session.projectName}\`. Reply here or use \`/dg\` or \`/gsd\` again.`);
       }
-
-      void this.startLoadingIndicator(mapped.sessionId);
 
       await interaction.editReply({
         content: mapped.threadId === activeChannelId
-          ? "Relayed to this thread."
+          ? messages.successReply
           : `Relayed to <#${mapped.threadId}>.`,
       });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      this.logger.error("slash command relay failed", { error: message });
+      this.logger.error("slash command relay failed", { error: message, input, projectDir: project.path });
       await interaction.editReply({ content: `Failed to relay message: ${message}` });
-      if (threadState) {
-        await this.sendToSession(threadState.sessionId, `❌ Failed to start or relay to GSD: ${message}`);
-      }
     }
+  }
+
+  private defaultProjectPrompt(project: ProjectRecord): string {
+    return existsSync(join(project.path, ".gsd"))
+      ? "continue with the current milestone"
+      : "/gsd init";
+  }
+
+  private getThreadStateForChannel(channelId: string): SessionThreadState | null {
+    const sessionId = this.threadToSession.get(channelId);
+    return sessionId ? this.sessionThreads.get(sessionId) ?? null : null;
+  }
+
+  private getActiveProjectDirForChannel(channelId: string): string | null {
+    return this.getThreadStateForChannel(channelId)?.projectDir ?? null;
+  }
+
+  private resolveProjectForInteraction(interaction: ChatInputCommandInteraction): ProjectRecord | null {
+    const state = this.getThreadStateForChannel(interaction.channelId);
+    if (!state) {
+      return null;
+    }
+
+    return {
+      id: basename(state.projectDir),
+      name: state.projectName,
+      directory: basename(state.projectDir),
+      path: state.projectDir,
+      createdAt: "",
+    };
+  }
+
+  private resolveProjectForSessionCommand(interaction: ChatInputCommandInteraction): ProjectRecord | null {
+    const requestedProject = interaction.options.getString("project")?.trim();
+    if (requestedProject) {
+      return findProject(this.config.gsdProjectDir, requestedProject);
+    }
+
+    const threadProject = this.resolveProjectForInteraction(interaction);
+    if (threadProject) {
+      return threadProject;
+    }
+
+    const currentSession = this.controller.getCurrentProjectSession();
+    if (!currentSession) {
+      return null;
+    }
+
+    return {
+      id: basename(currentSession.projectDir),
+      name: currentSession.projectName,
+      directory: basename(currentSession.projectDir),
+      path: currentSession.projectDir,
+      createdAt: "",
+    };
+  }
+
+  private async cleanupEndedSession(sessionId: string, projectDir: string): Promise<void> {
+    await this.stopReactionIndicator(sessionId);
+    this.outputStore.clear(sessionId);
+    this.streamedShellCommands.delete(sessionId);
+    this.thinkingStreams.delete(sessionId);
+    this.lastOutboundText.delete(sessionId);
+    this.unbindSession(sessionId);
+    this.sessionThreads.delete(sessionId);
+    this.pendingThreadByProject.delete(projectDir);
+  }
+
+  private async rebindSessionContext(previousSessionId: string, session: { sessionId: string; projectDir: string; projectName: string }): Promise<void> {
+    await this.stopReactionIndicator(previousSessionId);
+    this.outputStore.clear(previousSessionId);
+    this.streamedShellCommands.delete(previousSessionId);
+    this.thinkingStreams.delete(previousSessionId);
+    this.lastOutboundText.delete(previousSessionId);
+
+    const existing = this.sessionThreads.get(previousSessionId);
+    if (!existing) {
+      return;
+    }
+
+    this.unbindSession(previousSessionId);
+    this.sessionThreads.delete(previousSessionId);
+    existing.sessionId = session.sessionId;
+    existing.projectDir = session.projectDir;
+    existing.projectName = session.projectName;
+    this.bindSessionState(session.sessionId, existing);
   }
 
   private async handleReattachCommand(interaction: ChatInputCommandInteraction): Promise<void> {
     await interaction.deferReply({ flags: MessageFlags.Ephemeral });
 
-    const session = this.controller.getCurrentProjectSession();
+    const requestedProject = interaction.options.getString("project")?.trim();
+    const project = requestedProject
+      ? findProject(this.config.gsdProjectDir, requestedProject)
+      : null;
+
+    if (requestedProject && !project) {
+      await interaction.editReply({
+        content: `Unknown project: ${requestedProject}. Use \`/dg list\` to see registered projects.`,
+      });
+      return;
+    }
+
+    const session = project
+      ? this.controller.getProjectSession(project.path)
+      : this.controller.getCurrentProjectSession();
+
     if (!session) {
       await interaction.editReply({
-        content: "No active in-memory GSD session is available to reattach.",
+        content: project
+          ? `No active in-memory GSD session is available for \`${project.id}\`.`
+          : "No single active in-memory GSD session is available to reattach. Pass a project id when multiple sessions are active.",
       });
       return;
     }
@@ -351,13 +1031,15 @@ export class DiscordGsdService {
       });
       const state: SessionThreadState = {
         sessionId: session.sessionId,
+        projectDir: session.projectDir,
+        projectName: session.projectName,
         threadId: currentChannel.id,
         starterMessageId: marker.id,
         lastBotMessageIds: new Set([marker.id]),
       };
       this.unbindSession(session.sessionId);
       this.bindSessionState(session.sessionId, state);
-      await interaction.editReply({ content: "Reattached the current session to this thread." });
+      await interaction.editReply({ content: "Reattached the selected session to this thread." });
       return;
     }
 
@@ -373,17 +1055,23 @@ export class DiscordGsdService {
     });
     const state: SessionThreadState = {
       sessionId: session.sessionId,
+      projectDir: session.projectDir,
+      projectName: session.projectName,
       threadId: thread.id,
       starterMessageId: starter.id,
       lastBotMessageIds: new Set([starter.id]),
     };
     this.unbindSession(session.sessionId);
     this.bindSessionState(session.sessionId, state);
-    await interaction.editReply({ content: `Reattached the current session to <#${thread.id}>.` });
+    await interaction.editReply({ content: `Reattached the selected session to <#${thread.id}>.` });
   }
 
-  private async getOrCreatePendingThread(input: string): Promise<SessionThreadState> {
-    const currentSession = this.controller.getCurrentProjectSession();
+  private async getOrCreatePendingThread(
+    projectDir: string,
+    projectName: string,
+    input: string,
+  ): Promise<SessionThreadState> {
+    const currentSession = this.controller.getProjectSession(projectDir);
     if (currentSession) {
       const existing = this.sessionThreads.get(currentSession.sessionId);
       if (existing) {
@@ -391,32 +1079,33 @@ export class DiscordGsdService {
       }
     }
 
-    const pending = this.pendingThreadByProject.get(this.config.gsdProjectDir);
+    const pending = this.pendingThreadByProject.get(projectDir);
     if (pending) {
       return pending;
     }
 
     const parent = await this.getParentChannel();
-    const projectName = basename(this.config.gsdProjectDir);
     const starter = await parent.send({
       content: `🧵 Starting GSD session for \`${projectName}\`...`,
       allowedMentions: { parse: [] },
     });
 
     const thread = await starter.startThread({
-      name: buildThreadName(input),
+      name: buildThreadName(`${projectName} ${input}`),
       autoArchiveDuration: ThreadAutoArchiveDuration.OneWeek,
       reason: `discord-gsd session for ${projectName}`,
     });
 
     const state: SessionThreadState = {
       sessionId: "pending",
+      projectDir,
+      projectName,
       threadId: thread.id,
       starterMessageId: starter.id,
       lastBotMessageIds: new Set([starter.id]),
     };
 
-    this.pendingThreadByProject.set(this.config.gsdProjectDir, state);
+    this.pendingThreadByProject.set(projectDir, state);
     return state;
   }
 
@@ -440,7 +1129,7 @@ export class DiscordGsdService {
       return pending;
     }
 
-    const fallback = await this.getOrCreatePendingThread(input ?? projectName);
+    const fallback = await this.getOrCreatePendingThread(projectDir, projectName, input ?? projectName);
     fallback.sessionId = sessionId;
     this.pendingThreadByProject.delete(projectDir);
     this.unbindSession(sessionId);
@@ -465,12 +1154,6 @@ export class DiscordGsdService {
     state?.lastBotMessageIds.add(messageId);
   }
 
-  private forgetBotMessage(sessionId: string, messageId: string): void {
-    this.messageToSession.delete(messageId);
-    const state = this.sessionThreads.get(sessionId);
-    state?.lastBotMessageIds.delete(messageId);
-  }
-
   private unbindSession(sessionId: string): void {
     const existing = this.sessionThreads.get(sessionId);
     if (!existing) {
@@ -489,7 +1172,11 @@ export class DiscordGsdService {
     this.messageToSession.set(state.starterMessageId, sessionId);
   }
 
-  private async sendToSession(sessionId: string, content: string): Promise<void> {
+  private async sendToSession(
+    sessionId: string,
+    content: string,
+    options?: { trackAsReplyContext?: boolean },
+  ): Promise<void> {
     const state = this.sessionThreads.get(sessionId);
     if (!state) {
       this.logger.warn("dropping outbound Discord message for unknown session", { sessionId });
@@ -498,7 +1185,89 @@ export class DiscordGsdService {
 
     const thread = await this.fetchThread(state.threadId);
     const message = await thread.send({ content, allowedMentions: { parse: [] } });
+    if (options?.trackAsReplyContext !== false) {
+      this.lastOutboundText.set(sessionId, content);
+    }
     this.rememberBotMessage(sessionId, message.id);
+  }
+
+  private async removeOwnReaction(message: Message, emoji: string): Promise<void> {
+    const botUserId = this.client.user?.id;
+    if (!botUserId) {
+      return;
+    }
+
+    try {
+      const reaction = message.reactions.resolve(emoji);
+      if (!reaction) {
+        return;
+      }
+      await reaction.users.remove(botUserId).catch(() => {});
+    } catch {
+      // ignored
+    }
+  }
+
+  private async tickReactionIndicator(sessionId: string): Promise<void> {
+    const indicator = this.reactionIndicators.get(sessionId);
+    if (!indicator) {
+      return;
+    }
+
+    const nextEmoji = THINKING_REACTION_FRAMES[indicator.frameIndex % THINKING_REACTION_FRAMES.length] ?? THINKING_REACTION_FRAMES[0];
+    indicator.frameIndex += 1;
+
+    if (!nextEmoji) {
+      return;
+    }
+
+    try {
+      if (indicator.currentEmoji && indicator.currentEmoji !== nextEmoji) {
+        await this.removeOwnReaction(indicator.message, indicator.currentEmoji);
+      }
+      await indicator.message.react(nextEmoji).catch(() => {});
+      indicator.currentEmoji = nextEmoji;
+    } catch {
+      // ignored
+    }
+  }
+
+  private async stopReactionIndicator(sessionId: string, finalEmoji?: string): Promise<void> {
+    const indicator = this.reactionIndicators.get(sessionId);
+    if (!indicator) {
+      return;
+    }
+
+    this.reactionIndicators.delete(sessionId);
+    clearInterval(indicator.timer);
+
+    if (indicator.currentEmoji) {
+      await this.removeOwnReaction(indicator.message, indicator.currentEmoji);
+    }
+    if (indicator.statusEmoji) {
+      await this.removeOwnReaction(indicator.message, indicator.statusEmoji);
+    }
+
+    if (finalEmoji) {
+      await indicator.message.react(finalEmoji).catch(() => {});
+    }
+  }
+
+  private async startReactionIndicator(sessionId: string, message: Message): Promise<void> {
+    await this.stopReactionIndicator(sessionId);
+
+    const timer = setInterval(() => {
+      void this.tickReactionIndicator(sessionId);
+    }, THINKING_REACTION_INTERVAL_MS);
+    const indicator: MessageReactionIndicatorState = {
+      message,
+      frameIndex: 0,
+      statusEmoji: THINKING_STATUS_REACTION,
+      timer,
+    };
+    this.reactionIndicators.set(sessionId, indicator);
+    await message.react(THINKING_STATUS_REACTION).catch(() => {});
+    await this.tickReactionIndicator(sessionId);
   }
 
   private async onMessage(message: Message): Promise<void> {
@@ -523,9 +1292,28 @@ export class DiscordGsdService {
     }
 
     try {
-      await this.controller.relayToSession(relayTarget.sessionId, message.content);
-      void this.startLoadingIndicator(relayTarget.sessionId);
-      await message.react("📨").catch(() => {});
+      const session = this.controller.getSession(relayTarget.sessionId);
+      const normalization = session?.pendingBlocker
+        ? { text: message.content, kind: null }
+        : normalizeRelayInput(message.content, this.lastOutboundText.get(relayTarget.sessionId));
+
+      if (normalization.kind) {
+        this.logger.info("normalized relay input", {
+          sessionId: relayTarget.sessionId,
+          normalizationKind: normalization.kind,
+        });
+      }
+
+      const updatedSession = await this.controller.relayToSession(relayTarget.sessionId, normalization.text);
+      if (session) {
+        markProjectUsed(this.config.gsdProjectDir, session.projectDir);
+      }
+      if (updatedSession.isStreaming) {
+        await this.startReactionIndicator(updatedSession.sessionId, message);
+      } else {
+        await this.stopReactionIndicator(updatedSession.sessionId);
+        await message.react(RELAY_COMPLETE_REACTION).catch(() => {});
+      }
       this.logger.info("discord reply relayed", {
         sessionId: relayTarget.sessionId,
         via: relayTarget.via,
@@ -554,17 +1342,20 @@ export class DiscordGsdService {
   private async onSessionEvent(payload: SessionEventEnvelope): Promise<void> {
     await this.ensureSessionThreadState(payload.sessionId, payload.projectDir, basename(payload.projectDir));
     this.outputStore.updateFromEvent(payload.sessionId, payload.event);
+    await this.maybeForwardNotify(payload.sessionId, payload.event);
+    await this.maybeStreamShellCommand(payload.sessionId, payload.event);
     await this.maybeStreamThinking(payload.sessionId, payload.event);
 
     const eventType = (payload.event as Record<string, unknown>).type;
     if (eventType === "execution_complete") {
       await this.flushRemainingThinking(payload.sessionId);
       await this.flushFinalOutput(payload.sessionId, payload.event);
+      this.streamedShellCommands.delete(payload.sessionId);
     }
   }
 
   private async flushFinalOutput(sessionId: string, event: SdkAgentEvent): Promise<void> {
-    await this.stopLoadingIndicator(sessionId);
+    await this.stopReactionIndicator(sessionId, RELAY_COMPLETE_REACTION);
     const buffered = this.outputStore.consume(sessionId);
     const status = typeof (event as Record<string, unknown>).status === "string"
       ? String((event as Record<string, unknown>).status)
@@ -602,8 +1393,9 @@ export class DiscordGsdService {
   }
 
   private async onSessionBlocked(event: SessionBlockedEvent): Promise<void> {
-    await this.stopLoadingIndicator(event.sessionId);
+    await this.stopReactionIndicator(event.sessionId, RELAY_COMPLETE_REACTION);
     await this.flushRemainingThinking(event.sessionId);
+    this.streamedShellCommands.delete(event.sessionId);
     await this.ensureSessionThreadState(event.sessionId, event.projectDir, event.projectName);
     await this.sendToSession(event.sessionId, formatBlockerMessage(event.blocker));
     this.outputStore.clear(event.sessionId);
@@ -614,8 +1406,9 @@ export class DiscordGsdService {
   }
 
   private async onSessionCompleted(event: SessionCompletedEvent): Promise<void> {
-    await this.stopLoadingIndicator(event.sessionId);
+    await this.stopReactionIndicator(event.sessionId, RELAY_COMPLETE_REACTION);
     await this.flushRemainingThinking(event.sessionId);
+    this.streamedShellCommands.delete(event.sessionId);
     await this.ensureSessionThreadState(event.sessionId, event.projectDir, event.projectName);
     this.logger.info("session completed", {
       sessionId: event.sessionId,
@@ -624,8 +1417,9 @@ export class DiscordGsdService {
   }
 
   private async onSessionError(event: SessionErrorEvent): Promise<void> {
-    await this.stopLoadingIndicator(event.sessionId);
+    await this.stopReactionIndicator(event.sessionId, RELAY_ERROR_REACTION);
     await this.flushRemainingThinking(event.sessionId);
+    this.streamedShellCommands.delete(event.sessionId);
 
     const pending = this.pendingThreadByProject.get(event.projectDir);
     if (pending) {
@@ -645,17 +1439,57 @@ export class DiscordGsdService {
     });
   }
 
-  private async startLoadingIndicator(sessionId: string): Promise<void> {
-    if (this.loadingIndicators.has(sessionId)) {
+  private async maybeForwardNotify(sessionId: string, event: SdkAgentEvent): Promise<void> {
+    const record = event as Record<string, unknown>;
+    if (record.type !== "extension_ui_request" || record.method !== "notify") {
       return;
     }
 
-    const indicator: LoadingIndicatorState = { frameIndex: 0 };
-    this.loadingIndicators.set(sessionId, indicator);
+    const message = typeof record.message === "string" ? record.message.trim() : "";
+    if (!message) {
+      return;
+    }
 
-    indicator.activationTimer = setTimeout(() => {
-      void this.activateLoadingIndicator(sessionId);
-    }, 2000);
+    if (message.toLowerCase().includes("blocked:")) {
+      return;
+    }
+
+    const notifyType = typeof record.notifyType === "string" ? record.notifyType : "info";
+    const prefix = notifyType === "error"
+      ? "❌ "
+      : notifyType === "warning"
+        ? "⚠️ "
+        : "";
+
+    const chunks = splitIntoDiscordChunks(message, Math.max(1, this.config.discordMessageChunkSize - prefix.length));
+    for (const chunk of chunks) {
+      await this.sendToSession(sessionId, `${prefix}${chunk}`);
+    }
+  }
+
+  private async maybeStreamShellCommand(sessionId: string, event: SdkAgentEvent): Promise<void> {
+    const activity = extractShellCommandActivity(event);
+    if (!activity) {
+      return;
+    }
+
+    const seenToolCalls = this.streamedShellCommands.get(sessionId) ?? new Set<string>();
+    if (seenToolCalls.has(activity.toolCallId)) {
+      return;
+    }
+
+    const messages = formatShellCommandMessages(activity, this.config.discordMessageChunkSize);
+    for (const message of messages) {
+      await this.sendToSession(sessionId, message, { trackAsReplyContext: false });
+    }
+
+    seenToolCalls.add(activity.toolCallId);
+    this.streamedShellCommands.set(sessionId, seenToolCalls);
+    this.logger.info("shell command forwarded", {
+      sessionId,
+      toolName: activity.toolName,
+      label: activity.label,
+    });
   }
 
   private async maybeStreamThinking(sessionId: string, event: SdkAgentEvent): Promise<void> {
@@ -703,7 +1537,7 @@ export class DiscordGsdService {
       const header = state.modelLabel
         ? `[Thinking ${state.part} · ${state.modelLabel}]`
         : `[Thinking ${state.part}]`;
-      await this.sendToSession(sessionId, `${header}\n${chunk}`);
+      await this.sendToSession(sessionId, `${header}\n${chunk}`, { trackAsReplyContext: false });
     }
   }
 
@@ -723,87 +1557,6 @@ export class DiscordGsdService {
     const header = state.modelLabel
       ? `[Thinking ${state.part} · ${state.modelLabel}]`
       : `[Thinking ${state.part}]`;
-    await this.sendToSession(sessionId, `${header}\n${remaining}`);
-  }
-
-  private async activateLoadingIndicator(sessionId: string): Promise<void> {
-    const indicator = this.loadingIndicators.get(sessionId);
-    const state = this.sessionThreads.get(sessionId);
-    if (!indicator || !state) {
-      return;
-    }
-
-    try {
-      const thread = await this.fetchThread(state.threadId);
-      const message = await thread.send({
-        content: thinkingFrame(indicator.frameIndex),
-        allowedMentions: { parse: [] },
-      });
-      indicator.messageId = message.id;
-      this.rememberBotMessage(sessionId, message.id);
-      indicator.tickTimer = setInterval(() => {
-        void this.tickLoadingIndicator(sessionId);
-      }, 5000);
-    } catch (error) {
-      this.logger.warn("loading indicator activation failed", {
-        sessionId,
-        error: error instanceof Error ? error.message : String(error),
-      });
-      this.loadingIndicators.delete(sessionId);
-    }
-  }
-
-  private async tickLoadingIndicator(sessionId: string): Promise<void> {
-    const indicator = this.loadingIndicators.get(sessionId);
-    const state = this.sessionThreads.get(sessionId);
-    if (!indicator || !indicator.messageId || !state) {
-      return;
-    }
-
-    try {
-      const thread = await this.fetchThread(state.threadId);
-      indicator.frameIndex = (indicator.frameIndex + 1) % THINKING_FRAMES.length;
-      const message = await thread.messages.fetch(indicator.messageId);
-      await message.edit({ content: thinkingFrame(indicator.frameIndex) });
-    } catch (error) {
-      this.logger.warn("loading indicator tick failed", {
-        sessionId,
-        error: error instanceof Error ? error.message : String(error),
-      });
-    }
-  }
-
-  private async stopLoadingIndicator(sessionId: string): Promise<void> {
-    const indicator = this.loadingIndicators.get(sessionId);
-    if (!indicator) {
-      return;
-    }
-
-    this.loadingIndicators.delete(sessionId);
-    if (indicator.activationTimer) {
-      clearTimeout(indicator.activationTimer);
-    }
-    if (indicator.tickTimer) {
-      clearInterval(indicator.tickTimer);
-    }
-
-    if (!indicator.messageId) {
-      return;
-    }
-
-    const state = this.sessionThreads.get(sessionId);
-    if (!state) {
-      return;
-    }
-
-    try {
-      const thread = await this.fetchThread(state.threadId);
-      const message = await thread.messages.fetch(indicator.messageId);
-      await message.delete().catch(() => {});
-    } catch {
-      // non-fatal
-    } finally {
-      this.forgetBotMessage(sessionId, indicator.messageId);
-    }
+    await this.sendToSession(sessionId, `${header}\n${remaining}`, { trackAsReplyContext: false });
   }
 }

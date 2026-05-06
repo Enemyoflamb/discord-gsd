@@ -27,17 +27,29 @@ async function main(): Promise<void> {
   const controller = new SessionController(config, logger);
   const service = new DiscordGsdService(config, logger, controller);
 
+  // Ensure GSD child processes are cleaned up on ANY exit path —
+  // signals, uncaught exceptions, unhandled rejections.
   const shutdown = async (signal: string) => {
     logger.info("shutdown requested", { signal });
-    await service.stop();
+    await service.stop().catch(() => {});
     process.exit(0);
   };
 
-  process.on("SIGINT", () => {
-    void shutdown("SIGINT");
+  const crashShutdown = async (reason: string, error: unknown) => {
+    const message = error instanceof Error ? error.message : String(error);
+    logger.error(`${reason}: ${message}`);
+    await controller.shutdown().catch(() => {});
+    process.exit(1);
+  };
+
+  process.on("SIGINT", () => void shutdown("SIGINT"));
+  process.on("SIGTERM", () => void shutdown("SIGTERM"));
+
+  process.on("uncaughtException", (error) => {
+    void crashShutdown("uncaught exception", error);
   });
-  process.on("SIGTERM", () => {
-    void shutdown("SIGTERM");
+  process.on("unhandledRejection", (error) => {
+    void crashShutdown("unhandled rejection", error);
   });
 
   await service.start();
